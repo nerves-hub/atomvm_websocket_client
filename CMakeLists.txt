@@ -18,7 +18,6 @@ endif()
 
 idf_component_register(
     SRCS ${ATOMVM_WEBSOCKET_CLIENT_COMPONENT_SRCS}
-    INCLUDE_DIRS "ports/include"
     PRIV_REQUIRES "libatomvm" "avm_sys" "esp_websocket_client" "esp-tls" "esp_event"
     ${OPTIONAL_WHOLE_ARCHIVE}
 )
