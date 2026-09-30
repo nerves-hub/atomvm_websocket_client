@@ -563,6 +563,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
 #else
         ESP_LOGE(TAG, "verify => crt_bundle needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE");
         free_platform_data(data);
+        ctx->platform_data = NULL;
         context_destroy(ctx);
         return NULL;
 #endif
@@ -573,6 +574,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         if (UNLIKELY(!ok)) {
             ESP_LOGE(TAG, "cacert_pem is not a string or binary");
             free_platform_data(data);
+            ctx->platform_data = NULL;
             context_destroy(ctx);
             return NULL;
         }
@@ -593,6 +595,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         if (UNLIKELY(!ok_cert || !ok_key)) {
             ESP_LOGE(TAG, "client_cert must be {CertPem, KeyPem}");
             free_platform_data(data);
+            ctx->platform_data = NULL;
             context_destroy(ctx);
             return NULL;
         }
@@ -604,6 +607,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     if (IS_NULL_PTR(data->client)) {
         ESP_LOGE(TAG, "esp_websocket_client_init failed");
         free_platform_data(data);
+        ctx->platform_data = NULL;
         context_destroy(ctx);
         return NULL;
     }
@@ -615,6 +619,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         ESP_LOGE(TAG, "esp_websocket_client_start failed: %s", esp_err_to_name(err));
         esp_websocket_client_destroy(data->client);
         free_platform_data(data);
+        ctx->platform_data = NULL;
         context_destroy(ctx);
         return NULL;
     }
