@@ -96,14 +96,18 @@ time — a subprotocol that keeps server-side state must re-establish it on ever
 | --- | --- |
 | `crt_bundle` | ESP-IDF's bundled root certificates. Needs `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`. |
 | `{cacert_pem, Pem}` | Verify against one CA, for a private one. |
-| `none` | No verification. |
+| `none` | No verification. On a `wss://` URL it needs `CONFIG_ESP_TLS_INSECURE` and `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY` in the AtomVM build; without them esp-tls refuses an unverified connection, so `open/1` fails. |
 
-Omitting `verify` behaves as `none` and logs a warning, as does `none` itself.
-Without verification any machine on the network path can present itself as the
-server, so it is for development only.
+Omitting `verify` behaves as `none`, and both log a warning. Any other value
+makes `open/1` fail rather than falling back to `none`. Without verification any
+machine on the network path can present itself as the server, so it is for
+development only.
 
 `client_cert => {CertPem, KeyPem}` supplies a client certificate for mutual TLS.
 It is independent of `verify`.
+
+`open/1` returns `{error, badarg}` for a `verify`, `client_cert` or `headers`
+value it cannot use, rather than connecting without it.
 
 ## Options
 

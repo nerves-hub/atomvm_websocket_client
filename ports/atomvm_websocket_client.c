@@ -32,6 +32,7 @@
 #ifdef CONFIG_AVM_WEBSOCKET_CLIENT_ENABLE
 
 #include <string.h>
+#include <strings.h>
 
 #include <esp_log.h>
 #include <esp_websocket_client.h>
@@ -172,21 +173,30 @@ static const ErlNifResourceTypeInit connection_resource_type_init = {
 
 static ErlNifResourceType *connection_resource_type;
 
-/* Caller owns the returned string. */
-static char *maybe_get_string(term kv, AtomString key, GlobalContext *global)
+/*
+ * A string or binary as a C string the caller owns, or NULL if it is neither
+ * or memory ran out. interop_term_to_string can return NULL without setting
+ * ok, so the pointer is what gets tested.
+ */
+static char *term_to_c_string(term t)
 {
-    term value = interop_kv_get_value(kv, key, global);
-    if (!term_is_string(value) && !term_is_binary(value)) {
+    if (!term_is_list(t) && !term_is_binary(t)) {
         return NULL;
     }
 
-    int ok;
-    char *str = interop_term_to_string(value, &ok);
-    if (UNLIKELY(!ok)) {
-        ESP_LOGE(TAG, "Option is not a proper string or binary");
+    int ok = 0;
+    char *str = interop_term_to_string(t, &ok);
+    if (UNLIKELY(!ok || IS_NULL_PTR(str))) {
+        free(str);
         return NULL;
     }
     return str;
+}
+
+/* Caller owns the returned string. */
+static char *maybe_get_string(term kv, AtomString key, GlobalContext *global)
+{
+    return term_to_c_string(interop_kv_get_value(kv, key, global));
 }
 
 static int get_int_default(term kv, AtomString key, int default_value, GlobalContext *global)
@@ -208,68 +218,83 @@ static bool get_bool_default(term kv, AtomString key, bool default_value, Global
 }
 
 /*
- * esp_websocket_client takes extra headers as one CRLF-terminated block rather
- * than a list, so flatten [{K, V}] into "K: V\r\n...".
+ * Writes a header name or value at *p and advances past it. False if it is not
+ * a string or binary, or holds CR or LF, which would end the header early, or
+ * NUL, which would cut the block short.
  */
-static char *build_headers(term headers, GlobalContext *global)
+static bool write_header_part(term part, char **p)
 {
-    if (!term_is_list(headers) || term_is_nil(headers)) {
-        return NULL;
+    size_t len;
+    if (interop_iolist_size(part, &len) != InteropOk || interop_write_iolist(part, *p) != InteropOk
+        || memchr(*p, '\r', len) || memchr(*p, '\n', len) || memchr(*p, '\0', len)) {
+        return false;
+    }
+    *p += len;
+    return true;
+}
+
+/*
+ * esp_websocket_client takes extra headers as one CRLF-terminated block rather
+ * than a list, so flatten [{K, V}] into "K: V\r\n...". Anything else is
+ * refused: skipping a bad entry used to drop every header, Authorization
+ * included, and connect anyway. *block stays NULL when there are none.
+ */
+static bool build_headers(term headers, char **block)
+{
+    *block = NULL;
+    if (headers == term_invalid_term() || term_is_nil(headers)) {
+        return true;
     }
 
     size_t total = 0;
     term cursor = headers;
     while (term_is_nonempty_list(cursor)) {
         term pair = term_get_list_head(cursor);
-        if (!term_is_tuple(pair) || term_get_tuple_arity(pair) != 2) {
-            ESP_LOGE(TAG, "A header must be a {Name, Value} tuple");
-            return NULL;
+        size_t name_len;
+        size_t value_len;
+        if (!term_is_tuple(pair) || term_get_tuple_arity(pair) != 2
+            || interop_iolist_size(term_get_tuple_element(pair, 0), &name_len) != InteropOk
+            || interop_iolist_size(term_get_tuple_element(pair, 1), &value_len) != InteropOk
+            || name_len == 0) {
+            break;
         }
-
-        int ok_name;
-        int ok_value;
-        char *name = interop_term_to_string(term_get_tuple_element(pair, 0), &ok_name);
-        char *value = interop_term_to_string(term_get_tuple_element(pair, 1), &ok_value);
-        if (UNLIKELY(!ok_name || !ok_value)) {
-            free(name);
-            free(value);
-            ESP_LOGE(TAG, "A header name and value must be strings or binaries");
-            return NULL;
-        }
-
-        total += strlen(name) + strlen(value) + 4; /* ": " and CRLF */
-        free(name);
-        free(value);
-
+        total += name_len + value_len + 4; /* ": " and CRLF */
         cursor = term_get_list_tail(cursor);
     }
-
-    char *block = malloc(total + 1);
-    if (IS_NULL_PTR(block)) {
-        return NULL;
+    if (!term_is_nil(cursor)) {
+        ESP_LOGE(TAG, "headers must be a list of {Name, Value} strings or binaries");
+        return false;
     }
-    block[0] = '\0';
 
-    cursor = headers;
-    while (term_is_nonempty_list(cursor)) {
+    char *buf = malloc(total + 1);
+    if (IS_NULL_PTR(buf)) {
+        ESP_LOGE(TAG, "Could not allocate %u bytes for the headers", (unsigned) (total + 1));
+        return false;
+    }
+
+    char *p = buf;
+    for (cursor = headers; term_is_nonempty_list(cursor); cursor = term_get_list_tail(cursor)) {
         term pair = term_get_list_head(cursor);
-
-        int ok;
-        char *name = interop_term_to_string(term_get_tuple_element(pair, 0), &ok);
-        char *value = interop_term_to_string(term_get_tuple_element(pair, 1), &ok);
-
-        strcat(block, name);
-        strcat(block, ": ");
-        strcat(block, value);
-        strcat(block, "\r\n");
-
-        free(name);
-        free(value);
-
-        cursor = term_get_list_tail(cursor);
+        if (!write_header_part(term_get_tuple_element(pair, 0), &p)) {
+            goto bad_text;
+        }
+        memcpy(p, ": ", 2);
+        p += 2;
+        if (!write_header_part(term_get_tuple_element(pair, 1), &p)) {
+            goto bad_text;
+        }
+        memcpy(p, "\r\n", 2);
+        p += 2;
     }
+    *p = '\0';
 
-    return block;
+    *block = buf;
+    return true;
+
+bad_text:
+    ESP_LOGE(TAG, "A header name or value contains CR, LF or NUL");
+    free(buf);
+    return false;
 }
 
 static void send_simple(GlobalContext *global, int32_t owner, term port_term, term payload)
@@ -686,7 +711,9 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     conn->global = global;
     conn->owner = term_to_local_process_id(owner);
     conn->url = url;
-    conn->headers = build_headers(interop_kv_get_value(opts, headers_atom, global), global);
+    if (!build_headers(interop_kv_get_value(opts, headers_atom, global), &conn->headers)) {
+        goto fail;
+    }
     conn->max_message_size = get_int_default(
         opts, max_message_size_atom, CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE, global);
 
@@ -714,7 +741,9 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
      * Server verification. `none` is deliberately noisy: it leaves the device
      * unable to tell the real server from anything else on the path, which for
      * a device that takes firmware over this connection is not a small thing.
+     * A value this does not recognise is refused, never taken as `none`.
      */
+    bool tls = strncasecmp(conn->url, "wss://", 6) == 0;
     term verify = interop_kv_get_value(opts, verify_atom, global);
     if (verify == globalcontext_make_atom(global, crt_bundle_atom)) {
 #ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
@@ -725,27 +754,39 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
 #endif
     } else if (term_is_tuple(verify) && term_get_tuple_arity(verify) == 2
         && term_get_tuple_element(verify, 0) == globalcontext_make_atom(global, cacert_pem_atom)) {
-        int ok;
-        conn->cacert_pem = interop_term_to_string(term_get_tuple_element(verify, 1), &ok);
-        if (UNLIKELY(!ok)) {
+        conn->cacert_pem = term_to_c_string(term_get_tuple_element(verify, 1));
+        if (IS_NULL_PTR(conn->cacert_pem)) {
             ESP_LOGE(TAG, "cacert_pem is not a string or binary");
             goto fail;
         }
         cfg.cert_pem = conn->cacert_pem;
-    } else if (verify == globalcontext_make_atom(global, none_atom)) {
-        ESP_LOGW(TAG, "TLS server verification is DISABLED for %s", conn->url);
+    } else if (verify == globalcontext_make_atom(global, none_atom) || verify == term_invalid_term()) {
+        if (tls) {
+#ifdef CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY
+            /* Without the query string, which may carry a token. */
+            ESP_LOGW(TAG, "%sTLS server verification is DISABLED for %.*s",
+                verify == term_invalid_term() ? "No verify option given; " : "",
+                (int) strcspn(conn->url, "?"), conn->url);
+#else
+            /* With no CA, bundle or store configured, esp-tls refuses to connect. */
+            ESP_LOGE(TAG, "verify => none on a wss:// URL needs CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY; "
+                          "pass crt_bundle or {cacert_pem, Pem}");
+            goto fail;
+#endif
+        }
     } else {
-        ESP_LOGW(TAG, "No verify option given; TLS server verification is DISABLED for %s", conn->url);
+        ESP_LOGE(TAG, "verify must be crt_bundle, {cacert_pem, Pem} or none");
+        goto fail;
     }
 
     /* Optional client certificate, for mutual TLS. */
     term client_cert = interop_kv_get_value(opts, client_cert_atom, global);
-    if (term_is_tuple(client_cert) && term_get_tuple_arity(client_cert) == 2) {
-        int ok_cert;
-        int ok_key;
-        conn->client_cert_pem = interop_term_to_string(term_get_tuple_element(client_cert, 0), &ok_cert);
-        conn->client_key_pem = interop_term_to_string(term_get_tuple_element(client_cert, 1), &ok_key);
-        if (UNLIKELY(!ok_cert || !ok_key)) {
+    if (client_cert != term_invalid_term()) {
+        if (term_is_tuple(client_cert) && term_get_tuple_arity(client_cert) == 2) {
+            conn->client_cert_pem = term_to_c_string(term_get_tuple_element(client_cert, 0));
+            conn->client_key_pem = term_to_c_string(term_get_tuple_element(client_cert, 1));
+        }
+        if (IS_NULL_PTR(conn->client_cert_pem) || IS_NULL_PTR(conn->client_key_pem)) {
             ESP_LOGE(TAG, "client_cert must be {CertPem, KeyPem}");
             goto fail;
         }

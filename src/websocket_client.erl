@@ -37,9 +37,15 @@
 %%       a public host.</li>
 %%   <li>`{cacert_pem, Pem}' — verify against one CA, for a private one.</li>
 %%   <li>`none' — no verification at all. Development only: it makes any on-path
-%%       machine able to impersonate the server, and it logs a warning on every
-%%       connection so it cannot be left on by accident.</li>
+%%       machine able to impersonate the server, and it logs a warning when the
+%%       port opens so it cannot be left on by accident. On a `wss://' URL it
+%%       needs `CONFIG_ESP_TLS_INSECURE' and
+%%       `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY' in the AtomVM build, or the
+%%       open fails.</li>
 %% </ul>
+%%
+%% Any other `verify' value, or a `client_cert' or `headers' value the driver
+%% cannot use, makes `open/1' return `{error, badarg}'.
 %%
 %% `client_cert' supplies a client certificate for mutual TLS. It is independent
 %% of `verify' — a server can be verified with the certificate bundle while the
