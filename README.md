@@ -120,10 +120,14 @@ value it cannot use, rather than connecting without it.
 | `client_cert` | none |
 | `max_message_size` | `CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE` (4096) |
 | `buffer_size` | 1024 |
-| `ping_interval_ms` | the IDF default |
+| `ping_interval_ms` | the IDF default (10 s); rounded up to whole seconds |
 | `reconnect_timeout_ms` | 10000 |
 | `network_timeout_ms` | 10000; also the longest a send or `close/1` waits |
 | `disable_auto_reconnect` | `false` |
+
+The numeric options must be positive integers, `disable_auto_reconnect` a
+boolean and `owner` a local pid; anything else makes `open/1` return
+`{error, badarg}`.
 
 A message larger than `max_message_size` is discarded and reported as
 `{error, message_too_large}` rather than delivered truncated.

@@ -199,22 +199,42 @@ static char *maybe_get_string(term kv, AtomString key, GlobalContext *global)
     return term_to_c_string(interop_kv_get_value(kv, key, global));
 }
 
-static int get_int_default(term kv, AtomString key, int default_value, GlobalContext *global)
+/*
+ * An optional positive integer option, or default_value when it is absent.
+ * False, logging why, when it is anything else: a negative max_message_size
+ * used to become SIZE_MAX, which is no limit at all.
+ */
+static bool get_pos_int(term kv, AtomString key, int default_value, int *out, GlobalContext *global)
 {
     term value = interop_kv_get_value(kv, key, global);
-    return term_is_integer(value) ? term_to_int(value) : default_value;
-}
-
-static bool get_bool_default(term kv, AtomString key, bool default_value, GlobalContext *global)
-{
-    term value = interop_kv_get_value(kv, key, global);
-    if (value == TRUE_ATOM) {
+    if (value == term_invalid_term()) {
+        *out = default_value;
         return true;
     }
-    if (value == FALSE_ATOM) {
+    if (!term_is_integer(value) || term_to_int(value) <= 0) {
+        ESP_LOGE(TAG, "%.*s must be a positive integer", (int) atom_string_len(key),
+            (const char *) atom_string_data(key));
         return false;
     }
-    return default_value;
+    *out = term_to_int(value);
+    return true;
+}
+
+static bool get_bool(term kv, AtomString key, bool default_value, bool *out, GlobalContext *global)
+{
+    term value = interop_kv_get_value(kv, key, global);
+    if (value == term_invalid_term()) {
+        *out = default_value;
+    } else if (value == TRUE_ATOM) {
+        *out = true;
+    } else if (value == FALSE_ATOM) {
+        *out = false;
+    } else {
+        ESP_LOGE(TAG, "%.*s must be true or false", (int) atom_string_len(key),
+            (const char *) atom_string_data(key));
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -688,9 +708,10 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         return NULL;
     }
 
+    /* A remote pid decodes to no local process, and every event would be dropped. */
     term owner = interop_kv_get_value(opts, owner_atom, global);
-    if (UNLIKELY(!term_is_pid(owner))) {
-        ESP_LOGE(TAG, "Missing owner pid");
+    if (UNLIKELY(!term_is_local_pid(owner))) {
+        ESP_LOGE(TAG, "owner must be a local pid");
         return NULL;
     }
 
@@ -714,27 +735,34 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     if (!build_headers(interop_kv_get_value(opts, headers_atom, global), &conn->headers)) {
         goto fail;
     }
-    conn->max_message_size = get_int_default(
-        opts, max_message_size_atom, CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE, global);
 
     esp_websocket_client_config_t cfg = { 0 };
     cfg.uri = conn->url;
     cfg.headers = conn->headers;
-    cfg.buffer_size = get_int_default(opts, buffer_size_atom, 1024, global);
-    cfg.reconnect_timeout_ms = get_int_default(opts, reconnect_timeout_ms_atom, 10000, global);
-    cfg.network_timeout_ms = get_int_default(opts, network_timeout_ms_atom, 10000, global);
+
+    int max_message_size;
+    int ping_interval_ms;
+    if (!get_pos_int(opts, max_message_size_atom, CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE,
+            &max_message_size, global)
+        || !get_pos_int(opts, buffer_size_atom, 1024, &cfg.buffer_size, global)
+        || !get_pos_int(opts, reconnect_timeout_ms_atom, 10000, &cfg.reconnect_timeout_ms, global)
+        || !get_pos_int(opts, network_timeout_ms_atom, 10000, &cfg.network_timeout_ms, global)
+        || !get_pos_int(opts, ping_interval_ms_atom, 0, &ping_interval_ms, global)
+        || !get_bool(opts, disable_auto_reconnect_atom, false, &cfg.disable_auto_reconnect, global)) {
+        goto fail;
+    }
+    conn->max_message_size = (size_t) max_message_size;
     /* Sends and close run on a scheduler thread, so they get the bound the IDF
      * puts on its own writes instead of waiting on a stalled connection until
-     * lwIP gives up. The IDF also reads a non-positive value as 10 s. */
-    conn->timeout = pdMS_TO_TICKS(cfg.network_timeout_ms > 0 ? cfg.network_timeout_ms : 10000);
-    cfg.disable_auto_reconnect = get_bool_default(opts, disable_auto_reconnect_atom, false, global);
+     * lwIP gives up. */
+    conn->timeout = pdMS_TO_TICKS(cfg.network_timeout_ms);
     /* disable_auto_reconnect only covers drops. After a clean close by the
      * server the IDF stops for good unless this is set as well. */
     cfg.enable_close_reconnect = !cfg.disable_auto_reconnect;
 
-    int ping_interval_ms = get_int_default(opts, ping_interval_ms_atom, 0, global);
     if (ping_interval_ms > 0) {
-        cfg.ping_interval_sec = ping_interval_ms / 1000;
+        /* Rounded up: 0 would mean the IDF's 10 s default. */
+        cfg.ping_interval_sec = (ping_interval_ms + 999) / 1000;
     }
 
     /*
