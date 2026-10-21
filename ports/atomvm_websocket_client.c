@@ -295,6 +295,17 @@ static void free_platform_data(struct platform_data *data)
     free(data);
 }
 
+/*
+ * For a port that fails to open. context_destroy() frees ctx->platform_data
+ * itself, so the data has to be detached first or it is freed twice.
+ */
+static void destroy_port(Context *ctx)
+{
+    free_platform_data((struct platform_data *) ctx->platform_data);
+    ctx->platform_data = NULL;
+    context_destroy(ctx);
+}
+
 static void handle_data(
     GlobalContext *global, struct platform_data *data, term port_term, esp_websocket_event_data_t *event)
 {
@@ -578,8 +589,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
 #else
         ESP_LOGE(TAG, "verify => crt_bundle needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE");
-        free_platform_data(data);
-        context_destroy(ctx);
+        destroy_port(ctx);
         return NULL;
 #endif
     } else if (term_is_tuple(verify) && term_get_tuple_arity(verify) == 2
@@ -588,8 +598,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         data->cacert_pem = interop_term_to_string(term_get_tuple_element(verify, 1), &ok);
         if (UNLIKELY(!ok)) {
             ESP_LOGE(TAG, "cacert_pem is not a string or binary");
-            free_platform_data(data);
-            context_destroy(ctx);
+            destroy_port(ctx);
             return NULL;
         }
         cfg.cert_pem = data->cacert_pem;
@@ -608,8 +617,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         data->client_key_pem = interop_term_to_string(term_get_tuple_element(client_cert, 1), &ok_key);
         if (UNLIKELY(!ok_cert || !ok_key)) {
             ESP_LOGE(TAG, "client_cert must be {CertPem, KeyPem}");
-            free_platform_data(data);
-            context_destroy(ctx);
+            destroy_port(ctx);
             return NULL;
         }
         cfg.client_cert = data->client_cert_pem;
@@ -619,8 +627,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     data->client = esp_websocket_client_init(&cfg);
     if (IS_NULL_PTR(data->client)) {
         ESP_LOGE(TAG, "esp_websocket_client_init failed");
-        free_platform_data(data);
-        context_destroy(ctx);
+        destroy_port(ctx);
         return NULL;
     }
 
@@ -630,8 +637,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_websocket_client_start failed: %s", esp_err_to_name(err));
         esp_websocket_client_destroy(data->client);
-        free_platform_data(data);
-        context_destroy(ctx);
+        destroy_port(ctx);
         return NULL;
     }
 
