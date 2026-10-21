@@ -548,8 +548,7 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
             break;
     }
 
-    /* One allocation for the error tuple and the reply: a second one could
-     * collect the tuple before it is sent. */
+    /* Room for {Ref, Reply}, and for {error, Reason} when a send was refused. */
     port_ensure_available(ctx, PORT_REPLY_SIZE + (error ? TUPLE_SIZE(2) : 0));
     if (error) {
         reply = port_create_error_tuple(ctx, reply);
