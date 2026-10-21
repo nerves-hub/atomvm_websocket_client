@@ -365,7 +365,14 @@ static void event_handler(void *handler_args, esp_event_base_t base, int32_t eve
     struct platform_data *data = (struct platform_data *) ctx->platform_data;
     esp_websocket_event_data_t *event = (esp_websocket_event_data_t *) event_data;
 
+    /* Port in {websocket, Port, _} has to be the term open_port returned: a
+     * port from AtomVM 0.7 on, a pid before it. A pid never compares equal to
+     * a port, so tagging with the wrong one makes every receive miss. */
+#ifdef TERM_PORT_TAG
+    term port_term = term_port_from_local_process_id(ctx->process_id);
+#else
     term port_term = term_from_local_process_id(ctx->process_id);
+#endif
 
     Context *target = globalcontext_get_process_lock(global, data->owner);
     if (IS_NULL_PTR(target)) {
