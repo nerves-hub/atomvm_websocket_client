@@ -96,14 +96,18 @@ time — a subprotocol that keeps server-side state must re-establish it on ever
 | --- | --- |
 | `crt_bundle` | ESP-IDF's bundled root certificates. Needs `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE`. |
 | `{cacert_pem, Pem}` | Verify against one CA, for a private one. |
-| `none` | No verification. |
+| `none` | No verification. On a `wss://` URL it needs `CONFIG_ESP_TLS_INSECURE` and `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY` in the AtomVM build; without them esp-tls refuses an unverified connection, so `open/1` fails. |
 
-Omitting `verify` behaves as `none` and logs a warning, as does `none` itself.
-Without verification any machine on the network path can present itself as the
-server, so it is for development only.
+Omitting `verify` behaves as `none`, and both log a warning. Any other value
+makes `open/1` fail rather than falling back to `none`. Without verification any
+machine on the network path can present itself as the server, so it is for
+development only.
 
 `client_cert => {CertPem, KeyPem}` supplies a client certificate for mutual TLS.
 It is independent of `verify`.
+
+`open/1` returns `{error, badarg}` for a `verify`, `client_cert` or `headers`
+value it cannot use, rather than connecting without it.
 
 ## Options
 
@@ -116,10 +120,14 @@ It is independent of `verify`.
 | `client_cert` | none |
 | `max_message_size` | `CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE` (4096) |
 | `buffer_size` | 1024 |
-| `ping_interval_ms` | the IDF default |
+| `ping_interval_ms` | the IDF default (10 s); rounded up to whole seconds |
 | `reconnect_timeout_ms` | 10000 |
 | `network_timeout_ms` | 10000; also the longest a send or `close/1` waits |
 | `disable_auto_reconnect` | `false` |
+
+The numeric options must be positive integers, `disable_auto_reconnect` a
+boolean and `owner` a local pid; anything else makes `open/1` return
+`{error, badarg}`.
 
 A message larger than `max_message_size` is discarded and reported as
 `{error, message_too_large}` rather than delivered truncated.
