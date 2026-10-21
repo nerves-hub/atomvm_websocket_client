@@ -118,7 +118,7 @@ It is independent of `verify`.
 | `buffer_size` | 1024 |
 | `ping_interval_ms` | the IDF default |
 | `reconnect_timeout_ms` | 10000 |
-| `network_timeout_ms` | 10000 |
+| `network_timeout_ms` | 10000; also the longest a send or `close/1` waits |
 | `disable_auto_reconnect` | `false` |
 
 A message larger than `max_message_size` is discarded and reported as

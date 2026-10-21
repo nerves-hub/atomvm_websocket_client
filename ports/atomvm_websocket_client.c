@@ -111,6 +111,8 @@ struct platform_data
 {
     int32_t owner;
     esp_websocket_client_handle_t client;
+    /* How long a send or close may hold the scheduler thread that runs it. */
+    TickType_t timeout;
 
     /*
      * A message can arrive in several WEBSOCKET_EVENT_DATA callbacks, and can
@@ -479,10 +481,11 @@ static term do_send(Context *ctx, term payload, bool text)
     int len = term_binary_size(payload);
 
     int sent = text
-        ? esp_websocket_client_send_text(data->client, bytes, len, portMAX_DELAY)
-        : esp_websocket_client_send_bin(data->client, bytes, len, portMAX_DELAY);
+        ? esp_websocket_client_send_text(data->client, bytes, len, data->timeout)
+        : esp_websocket_client_send_bin(data->client, bytes, len, data->timeout);
 
-    if (sent < 0) {
+    /* A write that times out returns 0, having aborted the connection. */
+    if (sent != len) {
         return globalcontext_make_atom(ctx->global, send_failed_atom);
     }
 
@@ -531,7 +534,7 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
         case WebSocketCloseCmd:
             /* destroy() also unregisters the event handler, so no callback can
              * arrive after this and find freed platform data. */
-            esp_websocket_client_close(data->client, portMAX_DELAY);
+            esp_websocket_client_close(data->client, data->timeout);
             esp_websocket_client_destroy(data->client);
             free_platform_data(data);
             ctx->platform_data = NULL;
@@ -602,6 +605,10 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     cfg.buffer_size = get_int_default(opts, buffer_size_atom, 1024, global);
     cfg.reconnect_timeout_ms = get_int_default(opts, reconnect_timeout_ms_atom, 10000, global);
     cfg.network_timeout_ms = get_int_default(opts, network_timeout_ms_atom, 10000, global);
+    /* Sends and close run on a scheduler thread, so they get the bound the IDF
+     * puts on its own writes instead of waiting on a stalled connection until
+     * lwIP gives up. The IDF also reads a non-positive value as 10 s. */
+    data->timeout = pdMS_TO_TICKS(cfg.network_timeout_ms > 0 ? cfg.network_timeout_ms : 10000);
     cfg.disable_auto_reconnect = get_bool_default(opts, disable_auto_reconnect_atom, false, global);
     /* disable_auto_reconnect only covers drops. After a clean close by the
      * server the IDF stops for good unless this is set as well. */
