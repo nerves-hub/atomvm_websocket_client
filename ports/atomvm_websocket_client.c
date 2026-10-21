@@ -391,8 +391,16 @@ static void handle_data(
     }
 
     if (data->buf_len + event->data_len > data->buf_cap) {
-        /* payload_len is the whole frame, so this normally allocates once. */
-        size_t wanted = event->payload_len > 0 ? (size_t) event->payload_len : data->buf_len + event->data_len;
+        /*
+         * payload_len and payload_offset describe the current frame, not the
+         * message, so a continuation frame's rest is added to what earlier
+         * frames left in buf. Sizing for the whole rest of the frame normally
+         * allocates once per frame.
+         */
+        size_t wanted = data->buf_len + event->data_len;
+        if (event->payload_len > event->payload_offset + event->data_len) {
+            wanted += (size_t) (event->payload_len - event->payload_offset - event->data_len);
+        }
         if (wanted > data->max_message_size) {
             wanted = data->max_message_size;
         }
