@@ -76,7 +76,12 @@ a complete application that connects over TLS and echoes a message a second.
 | `{websocket, Port, {text, Binary}}` | A complete text message |
 | `{websocket, Port, {binary, Binary}}` | A complete binary message |
 | `{websocket, Port, {closed, Reason}}` | `normal` or `disconnected` |
-| `{websocket, Port, {error, Reason}}` | `message_too_large`, `out_of_memory`, or `{esp_tls, ...}` |
+| `{websocket, Port, {error, Reason}}` | `message_too_large`, `out_of_memory`, `{esp_tls, ...}`, or `{esp_websocket_client, Description}` |
+
+A connection error carries `{esp_tls, LastEspErr, StackErr, CertFlags}` only
+when ESP-IDF reports TLS codes for it. Otherwise it carries ESP-IDF's own
+description of the failure as a binary, which includes the TLS error and the
+HTTP status of a rejected upgrade.
 
 The client reconnects on its own, so `connected` arrives again after every
 disconnection. Any state the server holds for a session has to be rebuilt each
@@ -113,7 +118,7 @@ It is independent of `verify`.
 | `buffer_size` | 1024 |
 | `ping_interval_ms` | the IDF default |
 | `reconnect_timeout_ms` | 10000 |
-| `network_timeout_ms` | 10000 |
+| `network_timeout_ms` | 10000; also the longest a send or `close/1` waits |
 | `disable_auto_reconnect` | `false` |
 
 A message larger than `max_message_size` is discarded and reported as

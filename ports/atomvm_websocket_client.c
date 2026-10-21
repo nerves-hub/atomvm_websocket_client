@@ -72,6 +72,7 @@ static const char *const not_connected_atom = ATOM_STR("\xD", "not_connected");
 static const char *const out_of_memory_atom = ATOM_STR("\xD", "out_of_memory");
 static const char *const send_failed_atom = ATOM_STR("\xB", "send_failed");
 static const char *const esp_tls_atom = ATOM_STR("\x7", "esp_tls");
+static const char *const esp_websocket_client_atom = ATOM_STR("\x14", "esp_websocket_client");
 /* The default ERROR_ATOM is a term; send_tagged wants the AtomString. */
 static const char *const error_atom = ATOM_STR("\x5", "error");
 
@@ -110,6 +111,8 @@ struct platform_data
 {
     int32_t owner;
     esp_websocket_client_handle_t client;
+    /* How long a send or close may hold the scheduler thread that runs it. */
+    TickType_t timeout;
 
     /*
      * A message can arrive in several WEBSOCKET_EVENT_DATA callbacks, and can
@@ -270,6 +273,51 @@ static void send_frame(GlobalContext *global, struct platform_data *data, term p
     memory_destroy_heap(&heap, global);
 }
 
+/*
+ * The IDF fills the esp_tls fields of an ERROR event only when error_type is
+ * TCP_TRANSPORT, and it records an error's type only after posting the event
+ * for it, so most errors arrive with those fields uninitialised. They are sent
+ * only when the IDF vouches for them. Otherwise the client's own description
+ * of the failure is sent, which also names the TLS error and HTTP status.
+ *
+ *   {websocket, Port, {error, {esp_tls, LastEspErr, StackErr, CertFlags}}}
+ *   {websocket, Port, {error, {esp_websocket_client, Description}}}
+ */
+static void send_error(GlobalContext *global, int32_t owner, term port_term, esp_websocket_event_data_t *event)
+{
+    if (event->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT) {
+        BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3) + TUPLE_SIZE(2) + TUPLE_SIZE(4), heap);
+        term detail = term_alloc_tuple(4, &heap);
+        term_put_tuple_element(detail, 0, globalcontext_make_atom(global, esp_tls_atom));
+        term_put_tuple_element(detail, 1, term_from_int(event->error_handle.esp_tls_last_esp_err));
+        term_put_tuple_element(detail, 2, term_from_int(event->error_handle.esp_tls_stack_err));
+        term_put_tuple_element(detail, 3, term_from_int(event->error_handle.esp_tls_cert_verify_flags));
+        term inner = port_heap_create_tuple2(&heap, ERROR_ATOM, detail);
+        term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
+        port_send_message_from_task(global, term_from_local_process_id(owner), msg);
+        END_WITH_STACK_HEAP(heap, global);
+        return;
+    }
+
+    size_t len = (event->data_ptr != NULL && event->data_len > 0) ? (size_t) event->data_len : 0;
+    size_t requested = TUPLE_SIZE(3) + TUPLE_SIZE(2) + TUPLE_SIZE(2) + term_binary_heap_size(len);
+
+    Heap heap;
+    if (UNLIKELY(memory_init_heap(&heap, requested) != MEMORY_GC_OK)) {
+        send_tagged(global, owner, port_term, error_atom, out_of_memory_atom);
+        return;
+    }
+
+    term description = term_from_literal_binary(len > 0 ? event->data_ptr : "", len, &heap, global);
+    term detail = port_heap_create_tuple2(
+        &heap, globalcontext_make_atom(global, esp_websocket_client_atom), description);
+    term inner = port_heap_create_tuple2(&heap, ERROR_ATOM, detail);
+    term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
+
+    port_send_message_from_task(global, term_from_local_process_id(owner), msg);
+    memory_destroy_heap(&heap, global);
+}
+
 static void reset_buffer(struct platform_data *data)
 {
     free(data->buf);
@@ -295,15 +343,23 @@ static void free_platform_data(struct platform_data *data)
     free(data);
 }
 
+/*
+ * For a port that fails to open. context_destroy() frees ctx->platform_data
+ * itself, so the data has to be detached first or it is freed twice.
+ */
+static void destroy_port(Context *ctx)
+{
+    free_platform_data((struct platform_data *) ctx->platform_data);
+    ctx->platform_data = NULL;
+    context_destroy(ctx);
+}
+
 static void handle_data(
     GlobalContext *global, struct platform_data *data, term port_term, esp_websocket_event_data_t *event)
 {
-    if (event->op_code == WS_OPCODE_PING || event->op_code == WS_OPCODE_PONG) {
-        return;
-    }
-
-    if (event->op_code == WS_OPCODE_CLOSE) {
-        send_tagged(global, data->owner, port_term, closed_atom, normal_atom);
+    /* The IDF answers control frames itself. A CLOSE is reported once, by
+     * WEBSOCKET_EVENT_CLOSED when the closing handshake is over. */
+    if (event->op_code == WS_OPCODE_PING || event->op_code == WS_OPCODE_PONG || event->op_code == WS_OPCODE_CLOSE) {
         return;
     }
 
@@ -365,7 +421,14 @@ static void event_handler(void *handler_args, esp_event_base_t base, int32_t eve
     struct platform_data *data = (struct platform_data *) ctx->platform_data;
     esp_websocket_event_data_t *event = (esp_websocket_event_data_t *) event_data;
 
+    /* Port in {websocket, Port, _} has to be the term open_port returned: a
+     * port from AtomVM 0.7 on, a pid before it. A pid never compares equal to
+     * a port, so tagging with the wrong one makes every receive miss. */
+#ifdef TERM_PORT_TAG
+    term port_term = term_port_from_local_process_id(ctx->process_id);
+#else
     term port_term = term_from_local_process_id(ctx->process_id);
+#endif
 
     Context *target = globalcontext_get_process_lock(global, data->owner);
     if (IS_NULL_PTR(target)) {
@@ -391,21 +454,9 @@ static void event_handler(void *handler_args, esp_event_base_t base, int32_t eve
             send_tagged(global, data->owner, port_term, closed_atom, normal_atom);
             break;
 
-        case WEBSOCKET_EVENT_ERROR: {
-            /* {websocket, Port, {error, {esp_tls, LastEspErr, StackErr, CertFlags}}} */
-            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3) + TUPLE_SIZE(2) + TUPLE_SIZE(4), heap);
-            term detail = term_alloc_tuple(4, &heap);
-            term_put_tuple_element(detail, 0, globalcontext_make_atom(global, esp_tls_atom));
-            term_put_tuple_element(detail, 1, term_from_int(event->error_handle.esp_tls_last_esp_err));
-            term_put_tuple_element(detail, 2, term_from_int(event->error_handle.esp_tls_stack_err));
-            term_put_tuple_element(detail, 3, term_from_int(event->error_handle.esp_tls_cert_verify_flags));
-            term inner = port_heap_create_tuple2(&heap, ERROR_ATOM, detail);
-            term msg = port_heap_create_tuple3(
-                &heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
-            port_send_message_from_task(global, term_from_local_process_id(data->owner), msg);
-            END_WITH_STACK_HEAP(heap, global);
+        case WEBSOCKET_EVENT_ERROR:
+            send_error(global, data->owner, port_term, event);
             break;
-        }
 
         default:
             break;
@@ -430,10 +481,11 @@ static term do_send(Context *ctx, term payload, bool text)
     int len = term_binary_size(payload);
 
     int sent = text
-        ? esp_websocket_client_send_text(data->client, bytes, len, portMAX_DELAY)
-        : esp_websocket_client_send_bin(data->client, bytes, len, portMAX_DELAY);
+        ? esp_websocket_client_send_text(data->client, bytes, len, data->timeout)
+        : esp_websocket_client_send_bin(data->client, bytes, len, data->timeout);
 
-    if (sent < 0) {
+    /* A write that times out returns 0, having aborted the connection. */
+    if (sent != len) {
         return globalcontext_make_atom(ctx->global, send_failed_atom);
     }
 
@@ -460,7 +512,15 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
     term ref = gen_message.ref;
     term req = gen_message.req;
 
-    term cmd_term = term_is_tuple(req) ? term_get_tuple_element(req, 0) : req;
+    /* Requests are close and {send_text | send_binary, Payload}. Only a
+     * 2-tuple is taken apart, so any other shape gets badarg instead of being
+     * read past its end. */
+    term cmd_term = req;
+    term payload = term_nil();
+    if (term_is_tuple(req) && term_get_tuple_arity(req) == 2) {
+        cmd_term = term_get_tuple_element(req, 0);
+        payload = term_get_tuple_element(req, 1);
+    }
     int cmd = interop_atom_term_select_int(cmd_table, cmd_term, global);
 
     NativeHandlerResult result = NativeContinue;
@@ -470,19 +530,19 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
 
     switch (cmd) {
         case WebSocketSendTextCmd:
-            reply = do_send(ctx, term_get_tuple_element(req, 1), true);
+            reply = do_send(ctx, payload, true);
             error = reply != OK_ATOM;
             break;
 
         case WebSocketSendBinaryCmd:
-            reply = do_send(ctx, term_get_tuple_element(req, 1), false);
+            reply = do_send(ctx, payload, false);
             error = reply != OK_ATOM;
             break;
 
         case WebSocketCloseCmd:
             /* destroy() also unregisters the event handler, so no callback can
              * arrive after this and find freed platform data. */
-            esp_websocket_client_close(data->client, portMAX_DELAY);
+            esp_websocket_client_close(data->client, data->timeout);
             esp_websocket_client_destroy(data->client);
             free_platform_data(data);
             ctx->platform_data = NULL;
@@ -496,8 +556,7 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
             break;
     }
 
-    /* One allocation for the error tuple and the reply: a second one could
-     * collect the tuple before it is sent. */
+    /* Room for {Ref, Reply}, and for {error, Reason} when a send was refused. */
     port_ensure_available(ctx, PORT_REPLY_SIZE + (error ? TUPLE_SIZE(2) : 0));
     if (error) {
         reply = port_create_error_tuple(ctx, reply);
@@ -553,7 +612,14 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     cfg.buffer_size = get_int_default(opts, buffer_size_atom, 1024, global);
     cfg.reconnect_timeout_ms = get_int_default(opts, reconnect_timeout_ms_atom, 10000, global);
     cfg.network_timeout_ms = get_int_default(opts, network_timeout_ms_atom, 10000, global);
+    /* Sends and close run on a scheduler thread, so they get the bound the IDF
+     * puts on its own writes instead of waiting on a stalled connection until
+     * lwIP gives up. The IDF also reads a non-positive value as 10 s. */
+    data->timeout = pdMS_TO_TICKS(cfg.network_timeout_ms > 0 ? cfg.network_timeout_ms : 10000);
     cfg.disable_auto_reconnect = get_bool_default(opts, disable_auto_reconnect_atom, false, global);
+    /* disable_auto_reconnect only covers drops. After a clean close by the
+     * server the IDF stops for good unless this is set as well. */
+    cfg.enable_close_reconnect = !cfg.disable_auto_reconnect;
 
     int ping_interval_ms = get_int_default(opts, ping_interval_ms_atom, 0, global);
     if (ping_interval_ms > 0) {
@@ -571,8 +637,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
 #else
         ESP_LOGE(TAG, "verify => crt_bundle needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE");
-        free_platform_data(data);
-        context_destroy(ctx);
+        destroy_port(ctx);
         return NULL;
 #endif
     } else if (term_is_tuple(verify) && term_get_tuple_arity(verify) == 2
@@ -581,8 +646,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         data->cacert_pem = interop_term_to_string(term_get_tuple_element(verify, 1), &ok);
         if (UNLIKELY(!ok)) {
             ESP_LOGE(TAG, "cacert_pem is not a string or binary");
-            free_platform_data(data);
-            context_destroy(ctx);
+            destroy_port(ctx);
             return NULL;
         }
         cfg.cert_pem = data->cacert_pem;
@@ -601,8 +665,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         data->client_key_pem = interop_term_to_string(term_get_tuple_element(client_cert, 1), &ok_key);
         if (UNLIKELY(!ok_cert || !ok_key)) {
             ESP_LOGE(TAG, "client_cert must be {CertPem, KeyPem}");
-            free_platform_data(data);
-            context_destroy(ctx);
+            destroy_port(ctx);
             return NULL;
         }
         cfg.client_cert = data->client_cert_pem;
@@ -612,8 +675,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     data->client = esp_websocket_client_init(&cfg);
     if (IS_NULL_PTR(data->client)) {
         ESP_LOGE(TAG, "esp_websocket_client_init failed");
-        free_platform_data(data);
-        context_destroy(ctx);
+        destroy_port(ctx);
         return NULL;
     }
 
@@ -623,8 +685,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_websocket_client_start failed: %s", esp_err_to_name(err));
         esp_websocket_client_destroy(data->client);
-        free_platform_data(data);
-        context_destroy(ctx);
+        destroy_port(ctx);
         return NULL;
     }
 

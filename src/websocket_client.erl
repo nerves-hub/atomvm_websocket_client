@@ -104,7 +104,7 @@ open(_Config) ->
 %%-----------------------------------------------------------------------------
 -spec send_text(port(), iodata()) -> ok | {error, term()}.
 send_text(Port, Data) ->
-    port:call(Port, {send_text, iolist_to_binary(Data)}).
+    reply(port:call(Port, {send_text, iolist_to_binary(Data)})).
 
 %%-----------------------------------------------------------------------------
 %% @doc Send a binary frame.
@@ -112,7 +112,7 @@ send_text(Port, Data) ->
 %%-----------------------------------------------------------------------------
 -spec send_binary(port(), iodata()) -> ok | {error, term()}.
 send_binary(Port, Data) ->
-    port:call(Port, {send_binary, iolist_to_binary(Data)}).
+    reply(port:call(Port, {send_binary, iolist_to_binary(Data)})).
 
 %%-----------------------------------------------------------------------------
 %% @doc Close the connection and destroy the port.
@@ -121,3 +121,14 @@ send_binary(Port, Data) ->
 -spec close(port()) -> ok.
 close(Port) ->
     port:call(Port, close).
+
+%% A driver built before refused sends were wrapped replies the bare reason
+%% (`not_connected', `send_failed'). The driver is part of the VM image and this
+%% module part of the application, so an application update can run over an
+%% older driver; port:call/2 can also return a bare `out_of_memory'.
+reply(ok) ->
+    ok;
+reply({error, _} = Error) ->
+    Error;
+reply(Reason) ->
+    {error, Reason}.
