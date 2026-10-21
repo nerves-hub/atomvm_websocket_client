@@ -1,6 +1,9 @@
 # esp_websocket_client left ESP-IDF core in v5 and lives in esp-protocols, so it
 # is pulled in by the component manager rather than being required directly.
+# 1.8.0 is the first release whose close() returns once the CLOSE frame is sent
+# when enable_close_reconnect is set; earlier ones wait for a stop that never
+# comes until close()'s timeout runs out.
 dependencies:
-  espressif/esp_websocket_client: "^1.5.0"
+  espressif/esp_websocket_client: "^1.8.0"
   idf:
     version: ">=5.2"

@@ -309,12 +309,9 @@ static void destroy_port(Context *ctx)
 static void handle_data(
     GlobalContext *global, struct platform_data *data, term port_term, esp_websocket_event_data_t *event)
 {
-    if (event->op_code == WS_OPCODE_PING || event->op_code == WS_OPCODE_PONG) {
-        return;
-    }
-
-    if (event->op_code == WS_OPCODE_CLOSE) {
-        send_tagged(global, data->owner, port_term, closed_atom, normal_atom);
+    /* The IDF answers control frames itself. A CLOSE is reported once, by
+     * WEBSOCKET_EVENT_CLOSED when the closing handshake is over. */
+    if (event->op_code == WS_OPCODE_PING || event->op_code == WS_OPCODE_PONG || event->op_code == WS_OPCODE_CLOSE) {
         return;
     }
 
@@ -572,6 +569,9 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     cfg.reconnect_timeout_ms = get_int_default(opts, reconnect_timeout_ms_atom, 10000, global);
     cfg.network_timeout_ms = get_int_default(opts, network_timeout_ms_atom, 10000, global);
     cfg.disable_auto_reconnect = get_bool_default(opts, disable_auto_reconnect_atom, false, global);
+    /* disable_auto_reconnect only covers drops. After a clean close by the
+     * server the IDF stops for good unless this is set as well. */
+    cfg.enable_close_reconnect = !cfg.disable_auto_reconnect;
 
     int ping_interval_ms = get_int_default(opts, ping_interval_ms_atom, 0, global);
     if (ping_interval_ms > 0) {
