@@ -512,7 +512,15 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
     term ref = gen_message.ref;
     term req = gen_message.req;
 
-    term cmd_term = term_is_tuple(req) ? term_get_tuple_element(req, 0) : req;
+    /* Requests are close and {send_text | send_binary, Payload}. Only a
+     * 2-tuple is taken apart, so any other shape gets badarg instead of being
+     * read past its end. */
+    term cmd_term = req;
+    term payload = term_nil();
+    if (term_is_tuple(req) && term_get_tuple_arity(req) == 2) {
+        cmd_term = term_get_tuple_element(req, 0);
+        payload = term_get_tuple_element(req, 1);
+    }
     int cmd = interop_atom_term_select_int(cmd_table, cmd_term, global);
 
     NativeHandlerResult result = NativeContinue;
@@ -522,12 +530,12 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
 
     switch (cmd) {
         case WebSocketSendTextCmd:
-            reply = do_send(ctx, term_get_tuple_element(req, 1), true);
+            reply = do_send(ctx, payload, true);
             error = reply != OK_ATOM;
             break;
 
         case WebSocketSendBinaryCmd:
-            reply = do_send(ctx, term_get_tuple_element(req, 1), false);
+            reply = do_send(ctx, payload, false);
             error = reply != OK_ATOM;
             break;
 
