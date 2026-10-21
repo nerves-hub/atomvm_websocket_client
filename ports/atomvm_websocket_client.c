@@ -465,14 +465,18 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
 
     NativeHandlerResult result = NativeContinue;
     term reply;
+    /* A refused send is {error, Reason}, as send_text/2 and send_binary/2 document. */
+    bool error = false;
 
     switch (cmd) {
         case WebSocketSendTextCmd:
             reply = do_send(ctx, term_get_tuple_element(req, 1), true);
+            error = reply != OK_ATOM;
             break;
 
         case WebSocketSendBinaryCmd:
             reply = do_send(ctx, term_get_tuple_element(req, 1), false);
+            error = reply != OK_ATOM;
             break;
 
         case WebSocketCloseCmd:
@@ -492,7 +496,12 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
             break;
     }
 
-    port_ensure_available(ctx, PORT_REPLY_SIZE);
+    /* One allocation for the error tuple and the reply: a second one could
+     * collect the tuple before it is sent. */
+    port_ensure_available(ctx, PORT_REPLY_SIZE + (error ? TUPLE_SIZE(2) : 0));
+    if (error) {
+        reply = port_create_error_tuple(ctx, reply);
+    }
     port_send_reply(ctx, pid, ref, reply);
 
     mailbox_remove_message(&ctx->mailbox, &ctx->heap);
