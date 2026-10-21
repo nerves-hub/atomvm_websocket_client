@@ -42,6 +42,7 @@
 #include <mailbox.h>
 #include <memory.h>
 #include <port.h>
+#include <scheduler.h>
 #include <term.h>
 #include <utils.h>
 
@@ -344,14 +345,17 @@ static void free_platform_data(struct platform_data *data)
 }
 
 /*
- * For a port that fails to open. context_destroy() frees ctx->platform_data
- * itself, so the data has to be detached first or it is freed twice.
+ * For a port that fails to open. Destroying the context frees
+ * ctx->platform_data itself, so the data has to be detached first or it is
+ * freed twice. And it is scheduler_terminate, not context_destroy: context_new
+ * put ctx on the scheduler's waiting list, and only scheduler_terminate takes
+ * it off before freeing it.
  */
 static void destroy_port(Context *ctx)
 {
     free_platform_data((struct platform_data *) ctx->platform_data);
     ctx->platform_data = NULL;
-    context_destroy(ctx);
+    scheduler_terminate(ctx);
 }
 
 static void handle_data(
@@ -594,7 +598,7 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     struct platform_data *data = calloc(1, sizeof(struct platform_data));
     if (IS_NULL_PTR(data)) {
         free(url);
-        context_destroy(ctx);
+        scheduler_terminate(ctx);
         return NULL;
     }
 
