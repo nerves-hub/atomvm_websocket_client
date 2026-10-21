@@ -72,6 +72,7 @@ static const char *const not_connected_atom = ATOM_STR("\xD", "not_connected");
 static const char *const out_of_memory_atom = ATOM_STR("\xD", "out_of_memory");
 static const char *const send_failed_atom = ATOM_STR("\xB", "send_failed");
 static const char *const esp_tls_atom = ATOM_STR("\x7", "esp_tls");
+static const char *const esp_websocket_client_atom = ATOM_STR("\x14", "esp_websocket_client");
 /* The default ERROR_ATOM is a term; send_tagged wants the AtomString. */
 static const char *const error_atom = ATOM_STR("\x5", "error");
 
@@ -270,6 +271,51 @@ static void send_frame(GlobalContext *global, struct platform_data *data, term p
     memory_destroy_heap(&heap, global);
 }
 
+/*
+ * The IDF fills the esp_tls fields of an ERROR event only when error_type is
+ * TCP_TRANSPORT, and it records an error's type only after posting the event
+ * for it, so most errors arrive with those fields uninitialised. They are sent
+ * only when the IDF vouches for them. Otherwise the client's own description
+ * of the failure is sent, which also names the TLS error and HTTP status.
+ *
+ *   {websocket, Port, {error, {esp_tls, LastEspErr, StackErr, CertFlags}}}
+ *   {websocket, Port, {error, {esp_websocket_client, Description}}}
+ */
+static void send_error(GlobalContext *global, int32_t owner, term port_term, esp_websocket_event_data_t *event)
+{
+    if (event->error_handle.error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT) {
+        BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3) + TUPLE_SIZE(2) + TUPLE_SIZE(4), heap);
+        term detail = term_alloc_tuple(4, &heap);
+        term_put_tuple_element(detail, 0, globalcontext_make_atom(global, esp_tls_atom));
+        term_put_tuple_element(detail, 1, term_from_int(event->error_handle.esp_tls_last_esp_err));
+        term_put_tuple_element(detail, 2, term_from_int(event->error_handle.esp_tls_stack_err));
+        term_put_tuple_element(detail, 3, term_from_int(event->error_handle.esp_tls_cert_verify_flags));
+        term inner = port_heap_create_tuple2(&heap, ERROR_ATOM, detail);
+        term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
+        port_send_message_from_task(global, term_from_local_process_id(owner), msg);
+        END_WITH_STACK_HEAP(heap, global);
+        return;
+    }
+
+    size_t len = (event->data_ptr != NULL && event->data_len > 0) ? (size_t) event->data_len : 0;
+    size_t requested = TUPLE_SIZE(3) + TUPLE_SIZE(2) + TUPLE_SIZE(2) + term_binary_heap_size(len);
+
+    Heap heap;
+    if (UNLIKELY(memory_init_heap(&heap, requested) != MEMORY_GC_OK)) {
+        send_tagged(global, owner, port_term, error_atom, out_of_memory_atom);
+        return;
+    }
+
+    term description = term_from_literal_binary(len > 0 ? event->data_ptr : "", len, &heap, global);
+    term detail = port_heap_create_tuple2(
+        &heap, globalcontext_make_atom(global, esp_websocket_client_atom), description);
+    term inner = port_heap_create_tuple2(&heap, ERROR_ATOM, detail);
+    term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
+
+    port_send_message_from_task(global, term_from_local_process_id(owner), msg);
+    memory_destroy_heap(&heap, global);
+}
+
 static void reset_buffer(struct platform_data *data)
 {
     free(data->buf);
@@ -406,21 +452,9 @@ static void event_handler(void *handler_args, esp_event_base_t base, int32_t eve
             send_tagged(global, data->owner, port_term, closed_atom, normal_atom);
             break;
 
-        case WEBSOCKET_EVENT_ERROR: {
-            /* {websocket, Port, {error, {esp_tls, LastEspErr, StackErr, CertFlags}}} */
-            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3) + TUPLE_SIZE(2) + TUPLE_SIZE(4), heap);
-            term detail = term_alloc_tuple(4, &heap);
-            term_put_tuple_element(detail, 0, globalcontext_make_atom(global, esp_tls_atom));
-            term_put_tuple_element(detail, 1, term_from_int(event->error_handle.esp_tls_last_esp_err));
-            term_put_tuple_element(detail, 2, term_from_int(event->error_handle.esp_tls_stack_err));
-            term_put_tuple_element(detail, 3, term_from_int(event->error_handle.esp_tls_cert_verify_flags));
-            term inner = port_heap_create_tuple2(&heap, ERROR_ATOM, detail);
-            term msg = port_heap_create_tuple3(
-                &heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
-            port_send_message_from_task(global, term_from_local_process_id(data->owner), msg);
-            END_WITH_STACK_HEAP(heap, global);
+        case WEBSOCKET_EVENT_ERROR:
+            send_error(global, data->owner, port_term, event);
             break;
-        }
 
         default:
             break;
