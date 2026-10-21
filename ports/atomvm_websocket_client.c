@@ -148,7 +148,8 @@ struct connection
     size_t buf_cap;
     size_t max_message_size;
     uint8_t message_opcode;
-    bool overflowed;
+    /* Why the message being received is being thrown away, or NULL. */
+    AtomString discard_reason;
 
     /* Owned copies: the IDF client keeps the pointers it is given. */
     char *url;
@@ -348,7 +349,8 @@ static void send_frame(GlobalContext *global, struct connection *conn, term port
         return;
     }
 
-    term payload = term_from_literal_binary(conn->buf, conn->buf_len, &heap, global);
+    /* buf is NULL for an empty message. */
+    term payload = term_from_literal_binary(conn->buf ? conn->buf : "", conn->buf_len, &heap, global);
     term inner = port_heap_create_tuple2(&heap, globalcontext_make_atom(global, kind), payload);
     term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
 
@@ -401,13 +403,25 @@ static void send_error(GlobalContext *global, int32_t owner, term port_term, esp
     memory_destroy_heap_from_task(&heap, global);
 }
 
-static void reset_buffer(struct connection *conn)
+static void free_buffer(struct connection *conn)
 {
     free(conn->buf);
     conn->buf = NULL;
     conn->buf_len = 0;
     conn->buf_cap = 0;
-    conn->overflowed = false;
+}
+
+static void reset_buffer(struct connection *conn)
+{
+    free_buffer(conn);
+    conn->discard_reason = NULL;
+}
+
+/* Drops what is buffered now; the rest of the message is skipped, then reported. */
+static void discard_message(struct connection *conn, AtomString reason)
+{
+    free_buffer(conn);
+    conn->discard_reason = reason;
 }
 
 /*
@@ -442,51 +456,45 @@ static void handle_data(
         }
     }
 
-    if (conn->overflowed) {
-        /* Keep discarding until the message ends, then report once. */
-        if (event->fin && (event->payload_offset + event->data_len >= event->payload_len)) {
-            send_tagged(global, conn->owner, port_term, error_atom, message_too_large_atom);
-            reset_buffer(conn);
-        }
-        return;
-    }
-
-    if (conn->buf_len + event->data_len > conn->max_message_size) {
-        ESP_LOGW(TAG, "Message exceeds max_message_size (%u), discarding", (unsigned) conn->max_message_size);
-        conn->overflowed = true;
-        return;
-    }
-
-    if (conn->buf_len + event->data_len > conn->buf_cap) {
+    if (IS_NULL_PTR(conn->discard_reason)) {
         /*
          * payload_len and payload_offset describe the current frame, not the
-         * message, so a continuation frame's rest is added to what earlier
-         * frames left in buf. Sizing for the whole rest of the frame normally
-         * allocates once per frame.
+         * message, so what this frame still brings is added to what earlier
+         * frames left in buf. Knowing the rest of the frame refuses an
+         * oversized one before any of it is buffered, and normally means one
+         * allocation per frame.
          */
         size_t wanted = conn->buf_len + event->data_len;
         if (event->payload_len > event->payload_offset + event->data_len) {
             wanted += (size_t) (event->payload_len - event->payload_offset - event->data_len);
         }
         if (wanted > conn->max_message_size) {
-            wanted = conn->max_message_size;
+            ESP_LOGW(TAG, "Message exceeds max_message_size (%u), discarding", (unsigned) conn->max_message_size);
+            discard_message(conn, message_too_large_atom);
+        } else if (wanted > conn->buf_cap) {
+            char *grown = realloc(conn->buf, wanted);
+            if (IS_NULL_PTR(grown)) {
+                ESP_LOGW(TAG, "Could not allocate %u bytes for an incoming message", (unsigned) wanted);
+                discard_message(conn, out_of_memory_atom);
+            } else {
+                conn->buf = grown;
+                conn->buf_cap = wanted;
+            }
         }
-        char *grown = realloc(conn->buf, wanted);
-        if (IS_NULL_PTR(grown)) {
-            ESP_LOGW(TAG, "Could not allocate %u bytes for an incoming message", (unsigned) wanted);
-            conn->overflowed = true;
-            return;
-        }
-        conn->buf = grown;
-        conn->buf_cap = wanted;
     }
 
-    memcpy(conn->buf + conn->buf_len, event->data_ptr, event->data_len);
-    conn->buf_len += event->data_len;
+    if (IS_NULL_PTR(conn->discard_reason) && event->data_len > 0) {
+        memcpy(conn->buf + conn->buf_len, event->data_ptr, event->data_len);
+        conn->buf_len += event->data_len;
+    }
 
-    bool frame_complete = (event->payload_offset + event->data_len) >= event->payload_len;
-    if (frame_complete && event->fin) {
-        send_frame(global, conn, port_term);
+    /* Even when this chunk is the one that was refused, the message ends here: report it. */
+    if (event->fin && event->payload_offset + event->data_len >= event->payload_len) {
+        if (IS_NULL_PTR(conn->discard_reason)) {
+            send_frame(global, conn, port_term);
+        } else {
+            send_tagged(global, conn->owner, port_term, error_atom, conn->discard_reason);
+        }
         reset_buffer(conn);
     }
 }
@@ -532,11 +540,14 @@ static void event_handler(void *handler_args, esp_event_base_t base, int32_t eve
             handle_data(global, conn, port_term, event);
             break;
 
+        /* A message cut off by either can never complete; do not hold its buffer through the outage. */
         case WEBSOCKET_EVENT_DISCONNECTED:
+            reset_buffer(conn);
             send_tagged(global, conn->owner, port_term, closed_atom, disconnected_atom);
             break;
 
         case WEBSOCKET_EVENT_CLOSED:
+            reset_buffer(conn);
             send_tagged(global, conn->owner, port_term, closed_atom, normal_atom);
             break;
 
