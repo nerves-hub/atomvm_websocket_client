@@ -13,7 +13,13 @@
  * delivered with port_send_message_from_task, which is the API for posting to
  * a process from a thread the VM does not own.
  *
- * Note the pid conversions. `data->owner` is a local process id, an int32,
+ * That task can outlive the port. A port can end without the driver being
+ * called at all — exit/2, or a linked process exiting, has the scheduler
+ * destroy it directly — so the task never touches the port's Context. What it
+ * uses lives in `struct connection`, which is freed only after the client has
+ * been stopped.
+ *
+ * Note the pid conversions. `conn->owner` is a local process id, an int32,
  * while the port_send_message_* functions take a pid *term* and decode it
  * themselves. Passing the int32 straight through compiles — term is an
  * integer type — and then decodes to a process that does not exist, so every
@@ -37,6 +43,8 @@
 #include <atom.h>
 #include <context.h>
 #include <defaultatoms.h>
+#include <erl_nif.h>
+#include <erl_nif_priv.h>
 #include <globalcontext.h>
 #include <interop.h>
 #include <mailbox.h>
@@ -76,6 +84,8 @@ static const char *const esp_tls_atom = ATOM_STR("\x7", "esp_tls");
 static const char *const esp_websocket_client_atom = ATOM_STR("\x14", "esp_websocket_client");
 /* The default ERROR_ATOM is a term; send_tagged wants the AtomString. */
 static const char *const error_atom = ATOM_STR("\x5", "error");
+/* Sent to the port by connection_down when its owner exits. */
+static const char *const owner_down_atom = ATOM_STR("\xB", "$owner_down");
 
 /* option keys */
 static const char *const url_atom = ATOM_STR("\x3", "url");
@@ -108,9 +118,21 @@ static const AtomStringIntPair cmd_table[] = {
     SELECT_INT_DEFAULT(WebSocketInvalidCmd)
 };
 
-struct platform_data
+/*
+ * Everything the IDF task reads or writes. It is a NIF resource rather than
+ * the port's platform_data because context_destroy frees platform_data on
+ * every way a port ends, without calling the driver, while the IDF task may
+ * still be running. A monitor this resource holds on the port runs
+ * connection_down from context_destroy instead, and that stops the client
+ * before anything here is freed.
+ */
+struct connection
 {
+    GlobalContext *global;
+    int32_t port_id;
     int32_t owner;
+    ErlNifMonitor owner_monitor;
+    bool owner_monitored;
     esp_websocket_client_handle_t client;
     /* How long a send or close may hold the scheduler thread that runs it. */
     TickType_t timeout;
@@ -134,6 +156,21 @@ struct platform_data
     char *client_cert_pem;
     char *client_key_pem;
 };
+
+/* ctx->platform_data, which context_destroy frees with free(). */
+struct platform_data
+{
+    struct connection *conn;
+};
+
+static void connection_down(ErlNifEnv *caller_env, void *obj, ErlNifPid *pid, ErlNifMonitor *mon);
+
+static const ErlNifResourceTypeInit connection_resource_type_init = {
+    .members = 3,
+    .down = connection_down,
+};
+
+static ErlNifResourceType *connection_resource_type;
 
 /* Caller owns the returned string. */
 static char *maybe_get_string(term kv, AtomString key, GlobalContext *global)
@@ -253,25 +290,25 @@ static void send_tagged(GlobalContext *global, int32_t owner, term port_term, At
     END_WITH_STACK_HEAP(heap, global);
 }
 
-static void send_frame(GlobalContext *global, struct platform_data *data, term port_term)
+static void send_frame(GlobalContext *global, struct connection *conn, term port_term)
 {
-    AtomString kind = (data->message_opcode == WS_OPCODE_BINARY) ? binary_atom : text_atom;
+    AtomString kind = (conn->message_opcode == WS_OPCODE_BINARY) ? binary_atom : text_atom;
 
-    size_t requested = TUPLE_SIZE(3) + TUPLE_SIZE(2) + term_binary_heap_size(data->buf_len);
+    size_t requested = TUPLE_SIZE(3) + TUPLE_SIZE(2) + term_binary_heap_size(conn->buf_len);
 
     Heap heap;
     if (UNLIKELY(memory_init_heap(&heap, requested) != MEMORY_GC_OK)) {
         ESP_LOGW(TAG, "Could not allocate %u bytes to deliver a message", (unsigned) requested);
-        send_tagged(global, data->owner, port_term, error_atom, out_of_memory_atom);
+        send_tagged(global, conn->owner, port_term, error_atom, out_of_memory_atom);
         return;
     }
 
-    term payload = term_from_literal_binary(data->buf, data->buf_len, &heap, global);
+    term payload = term_from_literal_binary(conn->buf, conn->buf_len, &heap, global);
     term inner = port_heap_create_tuple2(&heap, globalcontext_make_atom(global, kind), payload);
     term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
 
-    port_send_message_from_task(global, term_from_local_process_id(data->owner), msg);
-    memory_destroy_heap(&heap, global);
+    port_send_message_from_task(global, term_from_local_process_id(conn->owner), msg);
+    memory_destroy_heap_from_task(&heap, global);
 }
 
 /*
@@ -316,50 +353,35 @@ static void send_error(GlobalContext *global, int32_t owner, term port_term, esp
     term msg = port_heap_create_tuple3(&heap, globalcontext_make_atom(global, websocket_atom), port_term, inner);
 
     port_send_message_from_task(global, term_from_local_process_id(owner), msg);
-    memory_destroy_heap(&heap, global);
+    memory_destroy_heap_from_task(&heap, global);
 }
 
-static void reset_buffer(struct platform_data *data)
+static void reset_buffer(struct connection *conn)
 {
-    free(data->buf);
-    data->buf = NULL;
-    data->buf_len = 0;
-    data->buf_cap = 0;
-    data->overflowed = false;
-}
-
-/*
- * The port driver registers no destroy callback, so anything malloc'd here is
- * freed on the way out of the close command. A device that reconnects by
- * reopening the port would otherwise leak its URL, headers and PEMs each time.
- */
-static void free_platform_data(struct platform_data *data)
-{
-    free(data->buf);
-    free(data->url);
-    free(data->headers);
-    free(data->cacert_pem);
-    free(data->client_cert_pem);
-    free(data->client_key_pem);
-    free(data);
+    free(conn->buf);
+    conn->buf = NULL;
+    conn->buf_len = 0;
+    conn->buf_cap = 0;
+    conn->overflowed = false;
 }
 
 /*
- * For a port that fails to open. Destroying the context frees
- * ctx->platform_data itself, so the data has to be detached first or it is
- * freed twice. And it is scheduler_terminate, not context_destroy: context_new
- * put ctx on the scheduler's waiting list, and only scheduler_terminate takes
- * it off before freeing it.
+ * A device that reconnects by reopening the port would otherwise leak its
+ * URL, headers and PEMs each time. Only once the client is destroyed: it keeps
+ * pointers to the PEMs.
  */
-static void destroy_port(Context *ctx)
+static void free_connection_contents(struct connection *conn)
 {
-    free_platform_data((struct platform_data *) ctx->platform_data);
-    ctx->platform_data = NULL;
-    scheduler_terminate(ctx);
+    free(conn->buf);
+    free(conn->url);
+    free(conn->headers);
+    free(conn->cacert_pem);
+    free(conn->client_cert_pem);
+    free(conn->client_key_pem);
 }
 
 static void handle_data(
-    GlobalContext *global, struct platform_data *data, term port_term, esp_websocket_event_data_t *event)
+    GlobalContext *global, struct connection *conn, term port_term, esp_websocket_event_data_t *event)
 {
     /* The IDF answers control frames itself. A CLOSE is reported once, by
      * WEBSOCKET_EVENT_CLOSED when the closing handshake is over. */
@@ -370,57 +392,57 @@ static void handle_data(
     /* A new message starts with a text or binary opcode; a continuation keeps the first one. */
     if (event->op_code == WS_OPCODE_TEXT || event->op_code == WS_OPCODE_BINARY) {
         if (event->payload_offset == 0) {
-            reset_buffer(data);
-            data->message_opcode = event->op_code;
+            reset_buffer(conn);
+            conn->message_opcode = event->op_code;
         }
     }
 
-    if (data->overflowed) {
+    if (conn->overflowed) {
         /* Keep discarding until the message ends, then report once. */
         if (event->fin && (event->payload_offset + event->data_len >= event->payload_len)) {
-            send_tagged(global, data->owner, port_term, error_atom, message_too_large_atom);
-            reset_buffer(data);
+            send_tagged(global, conn->owner, port_term, error_atom, message_too_large_atom);
+            reset_buffer(conn);
         }
         return;
     }
 
-    if (data->buf_len + event->data_len > data->max_message_size) {
-        ESP_LOGW(TAG, "Message exceeds max_message_size (%u), discarding", (unsigned) data->max_message_size);
-        data->overflowed = true;
+    if (conn->buf_len + event->data_len > conn->max_message_size) {
+        ESP_LOGW(TAG, "Message exceeds max_message_size (%u), discarding", (unsigned) conn->max_message_size);
+        conn->overflowed = true;
         return;
     }
 
-    if (data->buf_len + event->data_len > data->buf_cap) {
+    if (conn->buf_len + event->data_len > conn->buf_cap) {
         /*
          * payload_len and payload_offset describe the current frame, not the
          * message, so a continuation frame's rest is added to what earlier
          * frames left in buf. Sizing for the whole rest of the frame normally
          * allocates once per frame.
          */
-        size_t wanted = data->buf_len + event->data_len;
+        size_t wanted = conn->buf_len + event->data_len;
         if (event->payload_len > event->payload_offset + event->data_len) {
             wanted += (size_t) (event->payload_len - event->payload_offset - event->data_len);
         }
-        if (wanted > data->max_message_size) {
-            wanted = data->max_message_size;
+        if (wanted > conn->max_message_size) {
+            wanted = conn->max_message_size;
         }
-        char *grown = realloc(data->buf, wanted);
+        char *grown = realloc(conn->buf, wanted);
         if (IS_NULL_PTR(grown)) {
             ESP_LOGW(TAG, "Could not allocate %u bytes for an incoming message", (unsigned) wanted);
-            data->overflowed = true;
+            conn->overflowed = true;
             return;
         }
-        data->buf = grown;
-        data->buf_cap = wanted;
+        conn->buf = grown;
+        conn->buf_cap = wanted;
     }
 
-    memcpy(data->buf + data->buf_len, event->data_ptr, event->data_len);
-    data->buf_len += event->data_len;
+    memcpy(conn->buf + conn->buf_len, event->data_ptr, event->data_len);
+    conn->buf_len += event->data_len;
 
     bool frame_complete = (event->payload_offset + event->data_len) >= event->payload_len;
     if (frame_complete && event->fin) {
-        send_frame(global, data, port_term);
-        reset_buffer(data);
+        send_frame(global, conn, port_term);
+        reset_buffer(conn);
     }
 }
 
@@ -428,64 +450,78 @@ static void event_handler(void *handler_args, esp_event_base_t base, int32_t eve
 {
     UNUSED(base);
 
-    Context *ctx = (Context *) handler_args;
-    GlobalContext *global = ctx->global;
-    struct platform_data *data = (struct platform_data *) ctx->platform_data;
+    struct connection *conn = (struct connection *) handler_args;
+    GlobalContext *global = conn->global;
     esp_websocket_event_data_t *event = (esp_websocket_event_data_t *) event_data;
 
     /* Port in {websocket, Port, _} has to be the term open_port returned: a
      * port from AtomVM 0.7 on, a pid before it. A pid never compares equal to
      * a port, so tagging with the wrong one makes every receive miss. */
 #ifdef TERM_PORT_TAG
-    term port_term = term_port_from_local_process_id(ctx->process_id);
+    term port_term = term_port_from_local_process_id(conn->port_id);
 #else
-    term port_term = term_from_local_process_id(ctx->process_id);
+    term port_term = term_from_local_process_id(conn->port_id);
 #endif
 
-    Context *target = globalcontext_get_process_lock(global, data->owner);
+#ifndef AVM_NO_SMP
+    /*
+     * Sending from a task to a process that has exited leaves the process
+     * table read-locked (the from-task send only unlocks a process it found),
+     * so send only while the owner is known to be alive. Without SMP that send
+     * never walks the table, and walking it from here would race the scheduler.
+     */
+    Context *target = globalcontext_get_process_lock(global, conn->owner);
     if (IS_NULL_PTR(target)) {
         /* The owner is gone; nothing to deliver to. */
         return;
     }
+#endif
 
     switch ((esp_websocket_event_id_t) event_id) {
         case WEBSOCKET_EVENT_CONNECTED:
-            reset_buffer(data);
-            send_simple(global, data->owner, port_term, globalcontext_make_atom(global, connected_atom));
+            reset_buffer(conn);
+            send_simple(global, conn->owner, port_term, globalcontext_make_atom(global, connected_atom));
             break;
 
         case WEBSOCKET_EVENT_DATA:
-            handle_data(global, data, port_term, event);
+            handle_data(global, conn, port_term, event);
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
-            send_tagged(global, data->owner, port_term, closed_atom, disconnected_atom);
+            send_tagged(global, conn->owner, port_term, closed_atom, disconnected_atom);
             break;
 
         case WEBSOCKET_EVENT_CLOSED:
-            send_tagged(global, data->owner, port_term, closed_atom, normal_atom);
+            send_tagged(global, conn->owner, port_term, closed_atom, normal_atom);
             break;
 
         case WEBSOCKET_EVENT_ERROR:
-            send_error(global, data->owner, port_term, event);
+            send_error(global, conn->owner, port_term, event);
             break;
 
         default:
             break;
     }
 
+#ifndef AVM_NO_SMP
     globalcontext_get_process_unlock(global, target);
+#endif
+}
+
+static struct connection *port_connection(Context *ctx)
+{
+    return ((struct platform_data *) ctx->platform_data)->conn;
 }
 
 static term do_send(Context *ctx, term payload, bool text)
 {
-    struct platform_data *data = (struct platform_data *) ctx->platform_data;
+    struct connection *conn = port_connection(ctx);
 
     if (!term_is_binary(payload)) {
         return BADARG_ATOM;
     }
 
-    if (!esp_websocket_client_is_connected(data->client)) {
+    if (!esp_websocket_client_is_connected(conn->client)) {
         return globalcontext_make_atom(ctx->global, not_connected_atom);
     }
 
@@ -493,8 +529,8 @@ static term do_send(Context *ctx, term payload, bool text)
     int len = term_binary_size(payload);
 
     int sent = text
-        ? esp_websocket_client_send_text(data->client, bytes, len, data->timeout)
-        : esp_websocket_client_send_bin(data->client, bytes, len, data->timeout);
+        ? esp_websocket_client_send_text(conn->client, bytes, len, conn->timeout)
+        : esp_websocket_client_send_bin(conn->client, bytes, len, conn->timeout);
 
     /* A write that times out returns 0, having aborted the connection. */
     if (sent != len) {
@@ -507,10 +543,17 @@ static term do_send(Context *ctx, term payload, bool text)
 static NativeHandlerResult consume_mailbox(Context *ctx)
 {
     GlobalContext *global = ctx->global;
-    struct platform_data *data = (struct platform_data *) ctx->platform_data;
+    struct connection *conn = port_connection(ctx);
 
     Message *message = mailbox_first(&ctx->mailbox);
     term msg = message->message;
+
+    if (msg == globalcontext_make_atom(global, owner_down_atom)) {
+        /* The owner exited, and nothing else can close this port. */
+        esp_websocket_client_close(conn->client, conn->timeout);
+        mailbox_remove_message(&ctx->mailbox, &ctx->heap);
+        return NativeTerminate;
+    }
 
     /* A '$call' is {'$call', {Pid, Ref}, Req}; let the VM unpack it. */
     GenMessage gen_message;
@@ -552,12 +595,8 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
             break;
 
         case WebSocketCloseCmd:
-            /* destroy() also unregisters the event handler, so no callback can
-             * arrive after this and find freed platform data. */
-            esp_websocket_client_close(data->client, data->timeout);
-            esp_websocket_client_destroy(data->client);
-            free_platform_data(data);
-            ctx->platform_data = NULL;
+            /* connection_down destroys the client once the port terminates. */
+            esp_websocket_client_close(conn->client, conn->timeout);
             reply = OK_ATOM;
             result = NativeTerminate;
             break;
@@ -580,14 +619,50 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
     return result;
 }
 
+/*
+ * Runs from context_destroy, with the process table unlocked, when the port
+ * or its owner exits.
+ */
+static void connection_down(ErlNifEnv *caller_env, void *obj, ErlNifPid *pid, ErlNifMonitor *mon)
+{
+    UNUSED(mon);
+
+    struct connection *conn = (struct connection *) obj;
+    GlobalContext *global = conn->global;
+
+    if (*pid != conn->port_id) {
+        /*
+         * The owner exited, and nothing else can close this port, so ask it
+         * to close; this runs again for the port itself once it has.
+         */
+        globalcontext_send_message(global, conn->port_id, globalcontext_make_atom(global, owner_down_atom));
+        return;
+    }
+
+    if (conn->owner_monitored) {
+        enif_demonitor_process(caller_env, conn, &conn->owner_monitor);
+    }
+    /* destroy() waits for the IDF task to exit, so no event can follow it. */
+    esp_websocket_client_destroy(conn->client);
+    free_connection_contents(conn);
+    enif_release_resource(conn);
+}
+
 void atomvm_websocket_client_init(GlobalContext *global)
 {
-    UNUSED(global);
-    /* Nothing global to set up; each port owns its own IDF client. */
+    ErlNifEnv env;
+    erl_nif_env_partial_init_from_globalcontext(&env, global);
+    connection_resource_type = enif_init_resource_type(
+        &env, "websocket_client", &connection_resource_type_init, ERL_NIF_RT_CREATE, NULL);
 }
 
 Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
 {
+    if (IS_NULL_PTR(connection_resource_type)) {
+        ESP_LOGE(TAG, "The connection resource type was not created");
+        return NULL;
+    }
+
     term owner = interop_kv_get_value(opts, owner_atom, global);
     if (UNLIKELY(!term_is_pid(owner))) {
         ESP_LOGE(TAG, "Missing owner pid");
@@ -600,34 +675,31 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         return NULL;
     }
 
-    Context *ctx = context_new(global);
-    ctx->native_handler = consume_mailbox;
-
-    struct platform_data *data = calloc(1, sizeof(struct platform_data));
-    if (IS_NULL_PTR(data)) {
+    struct connection *conn = enif_alloc_resource(connection_resource_type, sizeof(struct connection));
+    if (IS_NULL_PTR(conn)) {
         free(url);
-        scheduler_terminate(ctx);
         return NULL;
     }
+    memset(conn, 0, sizeof(struct connection));
+    Context *ctx = NULL;
 
-    data->owner = term_to_local_process_id(owner);
-    data->url = url;
-    data->headers = build_headers(interop_kv_get_value(opts, headers_atom, global), global);
-    data->max_message_size = get_int_default(
+    conn->global = global;
+    conn->owner = term_to_local_process_id(owner);
+    conn->url = url;
+    conn->headers = build_headers(interop_kv_get_value(opts, headers_atom, global), global);
+    conn->max_message_size = get_int_default(
         opts, max_message_size_atom, CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE, global);
 
-    ctx->platform_data = data;
-
     esp_websocket_client_config_t cfg = { 0 };
-    cfg.uri = data->url;
-    cfg.headers = data->headers;
+    cfg.uri = conn->url;
+    cfg.headers = conn->headers;
     cfg.buffer_size = get_int_default(opts, buffer_size_atom, 1024, global);
     cfg.reconnect_timeout_ms = get_int_default(opts, reconnect_timeout_ms_atom, 10000, global);
     cfg.network_timeout_ms = get_int_default(opts, network_timeout_ms_atom, 10000, global);
     /* Sends and close run on a scheduler thread, so they get the bound the IDF
      * puts on its own writes instead of waiting on a stalled connection until
      * lwIP gives up. The IDF also reads a non-positive value as 10 s. */
-    data->timeout = pdMS_TO_TICKS(cfg.network_timeout_ms > 0 ? cfg.network_timeout_ms : 10000);
+    conn->timeout = pdMS_TO_TICKS(cfg.network_timeout_ms > 0 ? cfg.network_timeout_ms : 10000);
     cfg.disable_auto_reconnect = get_bool_default(opts, disable_auto_reconnect_atom, false, global);
     /* disable_auto_reconnect only covers drops. After a clean close by the
      * server the IDF stops for good unless this is set as well. */
@@ -649,23 +721,21 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         cfg.crt_bundle_attach = esp_crt_bundle_attach;
 #else
         ESP_LOGE(TAG, "verify => crt_bundle needs CONFIG_MBEDTLS_CERTIFICATE_BUNDLE");
-        destroy_port(ctx);
-        return NULL;
+        goto fail;
 #endif
     } else if (term_is_tuple(verify) && term_get_tuple_arity(verify) == 2
         && term_get_tuple_element(verify, 0) == globalcontext_make_atom(global, cacert_pem_atom)) {
         int ok;
-        data->cacert_pem = interop_term_to_string(term_get_tuple_element(verify, 1), &ok);
+        conn->cacert_pem = interop_term_to_string(term_get_tuple_element(verify, 1), &ok);
         if (UNLIKELY(!ok)) {
             ESP_LOGE(TAG, "cacert_pem is not a string or binary");
-            destroy_port(ctx);
-            return NULL;
+            goto fail;
         }
-        cfg.cert_pem = data->cacert_pem;
+        cfg.cert_pem = conn->cacert_pem;
     } else if (verify == globalcontext_make_atom(global, none_atom)) {
-        ESP_LOGW(TAG, "TLS server verification is DISABLED for %s", data->url);
+        ESP_LOGW(TAG, "TLS server verification is DISABLED for %s", conn->url);
     } else {
-        ESP_LOGW(TAG, "No verify option given; TLS server verification is DISABLED for %s", data->url);
+        ESP_LOGW(TAG, "No verify option given; TLS server verification is DISABLED for %s", conn->url);
     }
 
     /* Optional client certificate, for mutual TLS. */
@@ -673,35 +743,88 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
     if (term_is_tuple(client_cert) && term_get_tuple_arity(client_cert) == 2) {
         int ok_cert;
         int ok_key;
-        data->client_cert_pem = interop_term_to_string(term_get_tuple_element(client_cert, 0), &ok_cert);
-        data->client_key_pem = interop_term_to_string(term_get_tuple_element(client_cert, 1), &ok_key);
+        conn->client_cert_pem = interop_term_to_string(term_get_tuple_element(client_cert, 0), &ok_cert);
+        conn->client_key_pem = interop_term_to_string(term_get_tuple_element(client_cert, 1), &ok_key);
         if (UNLIKELY(!ok_cert || !ok_key)) {
             ESP_LOGE(TAG, "client_cert must be {CertPem, KeyPem}");
-            destroy_port(ctx);
-            return NULL;
+            goto fail;
         }
-        cfg.client_cert = data->client_cert_pem;
-        cfg.client_key = data->client_key_pem;
+        cfg.client_cert = conn->client_cert_pem;
+        cfg.client_key = conn->client_key_pem;
     }
 
-    data->client = esp_websocket_client_init(&cfg);
-    if (IS_NULL_PTR(data->client)) {
+    conn->client = esp_websocket_client_init(&cfg);
+    if (IS_NULL_PTR(conn->client)) {
         ESP_LOGE(TAG, "esp_websocket_client_init failed");
-        destroy_port(ctx);
-        return NULL;
+        goto fail;
     }
 
-    esp_websocket_register_events(data->client, WEBSOCKET_EVENT_ANY, event_handler, (void *) ctx);
+    ctx = context_new(global);
+    if (IS_NULL_PTR(ctx)) {
+        goto fail;
+    }
+    struct platform_data *data = malloc(sizeof(struct platform_data));
+    if (IS_NULL_PTR(data)) {
+        goto fail;
+    }
+    data->conn = conn;
+    ctx->native_handler = consume_mailbox;
+    ctx->platform_data = data;
+    conn->port_id = ctx->process_id;
 
-    esp_err_t err = esp_websocket_client_start(data->client);
+    if (UNLIKELY(esp_websocket_register_events(conn->client, WEBSOCKET_EVENT_ANY, event_handler, conn) != ESP_OK)) {
+        ESP_LOGE(TAG, "esp_websocket_register_events failed");
+        goto fail;
+    }
+
+    esp_err_t err = esp_websocket_client_start(conn->client);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_websocket_client_start failed: %s", esp_err_to_name(err));
-        esp_websocket_client_destroy(data->client);
-        destroy_port(ctx);
-        return NULL;
+        goto fail;
     }
 
+    /*
+     * The monitors come last. Monitoring the port lets another scheduler run
+     * it, and from then on only the port may end itself: connection_down,
+     * which context_destroy runs however that happens, owns the teardown. The
+     * extra reference keeps conn alive while this function still writes to it.
+     */
+    enif_keep_resource(conn);
+    ErlNifEnv env;
+    erl_nif_env_partial_init_from_globalcontext(&env, global);
+    if (UNLIKELY(enif_monitor_process(&env, conn, &conn->port_id, NULL) != 0)) {
+        enif_release_resource(conn);
+        goto fail;
+    }
+
+    ErlNifMonitor owner_monitor;
+    if (UNLIKELY(enif_monitor_process(&env, conn, &conn->owner, &owner_monitor) != 0)) {
+        ESP_LOGE(TAG, "The owner has already exited");
+        globalcontext_send_message(global, conn->port_id, globalcontext_make_atom(global, owner_down_atom));
+        enif_release_resource(conn);
+        return NULL;
+    }
+    conn->owner_monitor = owner_monitor;
+    conn->owner_monitored = true;
+    enif_release_resource(conn);
+
     return ctx;
+
+fail:
+    if (ctx) {
+        /*
+         * Not context_destroy: context_new put ctx on the scheduler's waiting
+         * list, and only scheduler_terminate takes it off before freeing it.
+         * It frees platform_data, the box around conn, itself.
+         */
+        scheduler_terminate(ctx);
+    }
+    if (conn->client) {
+        esp_websocket_client_destroy(conn->client);
+    }
+    free_connection_contents(conn);
+    enif_release_resource(conn);
+    return NULL;
 }
 
 REGISTER_PORT_DRIVER(
