@@ -106,8 +106,8 @@ development only.
 `client_cert => {CertPem, KeyPem}` supplies a client certificate for mutual TLS.
 It is independent of `verify`.
 
-`open/1` returns `{error, badarg}` for a `verify`, `client_cert` or `headers`
-value it cannot use, rather than connecting without it.
+`open/1` returns `{error, badarg}` for a `verify`, `client_cert`, `headers` or
+`user_agent` value it cannot use, rather than connecting without it.
 
 ## Options
 
@@ -116,6 +116,7 @@ value it cannot use, rather than connecting without it.
 | `url` | required |
 | `owner` | the calling process |
 | `headers` | none — `[{Name, Value}]`, sent on the opening handshake |
+| `user_agent` | ESP-IDF's `ESP32 Websocket Client`; set it here, not in `headers`, which would send a second `User-Agent` line |
 | `verify` | none (with a warning) |
 | `client_cert` | none |
 | `max_message_size` | `CONFIG_AVM_WEBSOCKET_CLIENT_MAX_MESSAGE_SIZE` (4096) |

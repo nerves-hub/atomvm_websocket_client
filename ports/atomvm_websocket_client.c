@@ -92,6 +92,7 @@ static const char *const owner_down_atom = ATOM_STR("\xB", "$owner_down");
 static const char *const url_atom = ATOM_STR("\x3", "url");
 static const char *const owner_atom = ATOM_STR("\x5", "owner");
 static const char *const headers_atom = ATOM_STR("\x7", "headers");
+static const char *const user_agent_atom = ATOM_STR("\xA", "user_agent");
 static const char *const verify_atom = ATOM_STR("\x6", "verify");
 static const char *const crt_bundle_atom = ATOM_STR("\xA", "crt_bundle");
 static const char *const cacert_pem_atom = ATOM_STR("\xA", "cacert_pem");
@@ -154,6 +155,7 @@ struct connection
     /* Owned copies: the IDF client keeps the pointers it is given. */
     char *url;
     char *headers;
+    char *user_agent;
     char *cacert_pem;
     char *client_cert_pem;
     char *client_key_pem;
@@ -434,6 +436,7 @@ static void free_connection_contents(struct connection *conn)
     free(conn->buf);
     free(conn->url);
     free(conn->headers);
+    free(conn->user_agent);
     free(conn->cacert_pem);
     free(conn->client_cert_pem);
     free(conn->client_key_pem);
@@ -747,9 +750,24 @@ Context *atomvm_websocket_client_create_port(GlobalContext *global, term opts)
         goto fail;
     }
 
+    /*
+     * The IDF transport always writes a User-Agent line, its own
+     * "ESP32 Websocket Client" by default, before the extra headers: one in
+     * headers would be a second line, and servers read the first.
+     */
+    term user_agent = interop_kv_get_value(opts, user_agent_atom, global);
+    if (user_agent != term_invalid_term()) {
+        conn->user_agent = term_to_c_string(user_agent);
+        if (IS_NULL_PTR(conn->user_agent)) {
+            ESP_LOGE(TAG, "user_agent must be a string or a binary");
+            goto fail;
+        }
+    }
+
     esp_websocket_client_config_t cfg = { 0 };
     cfg.uri = conn->url;
     cfg.headers = conn->headers;
+    cfg.user_agent = conn->user_agent;
 
     int max_message_size;
     int ping_interval_ms;

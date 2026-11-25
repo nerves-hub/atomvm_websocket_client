@@ -44,8 +44,12 @@
 %%       open fails.</li>
 %% </ul>
 %%
-%% Any other `verify' value, or a `client_cert' or `headers' value the driver
-%% cannot use, makes `open/1' return `{error, badarg}'.
+%% `user_agent' replaces the `User-Agent' of the upgrade request, which is
+%% otherwise ESP-IDF's `ESP32 Websocket Client'. Put it here, not in `headers':
+%% ESP-IDF writes its own line first, so a header would be a second one.
+%%
+%% Any other `verify' value, or a `client_cert', `headers' or `user_agent' value
+%% the driver cannot use, makes `open/1' return `{error, badarg}'.
 %%
 %% `client_cert' supplies a client certificate for mutual TLS. It is independent
 %% of `verify' — a server can be verified with the certificate bundle while the
@@ -69,6 +73,7 @@
     url := string() | binary(),
     owner => pid(),
     headers => [{string() | binary(), string() | binary()}],
+    user_agent => string() | binary(),
     verify => verify(),
     client_cert => {Cert :: binary(), Key :: binary()},
     max_message_size => pos_integer(),
